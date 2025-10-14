@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Users, FolderOpen, CheckSquare, TrendingUp } from 'lucide-react';
+import { Users, FolderOpen, CheckSquare, TrendingUp, Calendar } from 'lucide-react';
 import MetricCard from './MetricCard';
 import ProgressChart from './ProgressChart';
 import ProjectStatusChart from './ProjectStatusChart';
@@ -7,15 +7,15 @@ import DepartmentChart from './DepartmentChart';
 import RecentActivity from './RecentActivity';
 import { useAuth } from '../../contexts/AuthContext';
 import { dashboardService } from '../../services/dashboardService';
-import { InternDTO, internService } from '../../services/internService';
+import { internService } from '../../services/internService';
+import { projectService } from '../../services/projectService';
+import { taskService } from '../../services/taskService';
 import { useApiError } from '../../hooks/useApiError';
 
 export default function Dashboard() {
   const { authUser } = useAuth();
   const { handleApiError } = useApiError();
 
-  const [interns, setInterns] = useState<InternDTO[]>([]);
-  const [filteredInterns, setFilteredInterns] = useState<InternDTO[]>([]);
   const [loading, setLoading] = useState(true);
 
   const [metrics, setMetrics] = useState({
@@ -23,58 +23,96 @@ export default function Dashboard() {
     activeProjects: 0,
     completedTasks: 0,
     successRate: 0,
+    daysRemaining: 0,
   });
 
-  // Chargement des stagiaires selon le rôle
-  useEffect(() => {
-    loadInterns();
-  }, [authUser]);
-
-  const loadInterns = async () => {
-    try {
-      setLoading(true);
-      let data: InternDTO[];
-
-      if (authUser?.role === 'ADMIN') {
-        data = await internService.getAllInterns();
-      } else if (authUser?.role === 'ENCADREUR') {
-        const userId = authUser.profile.userID;
-        data = await internService.getAllInterns({ encadreurUserId: userId });
-      } else {
-        data = [];
-      }
-
-      setInterns(data);
-      setFilteredInterns(data);
-
-      setMetrics((prev) => ({
-        ...prev,
-        totalInterns: data.length,
-      }));
-    } catch (error: any) {
-      handleApiError(error, 'Erreur lors du chargement des stagiaires');
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  // Chargement des autres métriques du dashboard
   useEffect(() => {
     loadDashboardData();
-  }, []);
+  }, [authUser]);
 
   const loadDashboardData = async () => {
+    if (!authUser) return;
+
     try {
       setLoading(true);
-      const data = await dashboardService.getDashboardMetrics();
-      setMetrics((prev) => ({
-        ...prev,
-        activeProjects: data.activeProjects || 0,
-        completedTasks: data.completedTasks || 0,
-        successRate: 85, // Valeur statique pour l'instant
-      }));
-    } catch (error) {
-      console.error('Error loading dashboard:', error);
+      const userId = authUser.profile.userID;
+
+      if (authUser.role === 'ADMIN') {
+        const [interns, projects, tasks] = await Promise.all([
+          internService.getAllInterns(),
+          projectService.getAllProjects(),
+          taskService.getAllTasks()
+        ]);
+
+        const activeProjects = projects.filter(p => p.status === 'IN_PROGRESS').length;
+        const completedTasks = tasks.filter(t => t.status === 'DONE').length;
+        const completedProjects = projects.filter(p => p.status === 'COMPLETED').length;
+        const successRate = projects.length > 0 ? (completedProjects * 100.0 / projects.length) : 0;
+
+        setMetrics({
+          totalInterns: interns.length,
+          activeProjects,
+          completedTasks,
+          successRate,
+          daysRemaining: 0,
+        });
+
+      } else if (authUser.role === 'ENCADREUR') {
+        const [interns, projects, allTasks] = await Promise.all([
+          internService.getAllInterns({ encadreurUserId: userId }),
+          projectService.getAllProjects({ encadreurId: userId }),
+          taskService.getAllTasks()
+        ]);
+
+        const internIds = interns.map(i => i.userId);
+        const tasksForMyInterns = allTasks.filter(t => internIds.includes(t.assignedTo));
+        const completedTasks = tasksForMyInterns.filter(t => t.status === 'DONE').length;
+        const activeProjects = projects.filter(p => p.status === 'IN_PROGRESS').length;
+        const completedProjects = projects.filter(p => p.status === 'COMPLETED').length;
+        const successRate = projects.length > 0 ? (completedProjects * 100.0 / projects.length) : 0;
+
+        setMetrics({
+          totalInterns: interns.length,
+          activeProjects,
+          completedTasks,
+          successRate,
+          daysRemaining: 0,
+        });
+
+      } else if (authUser.role === 'STAGIAIRE') {
+        const [internData, projects, tasks] = await Promise.all([
+          internService.getAllInterns(),
+          projectService.getAllProjects(),
+          taskService.getAllTasks({ userId })
+        ]);
+
+        const currentIntern = internData.find(i => i.userId === userId);
+        const myProjects = projects.filter(p => p.stagiaireId === currentIntern?.id);
+
+        let daysRemaining = 0;
+        if (currentIntern?.endDate) {
+          const endDate = new Date(currentIntern.endDate);
+          const today = new Date();
+          const diffTime = endDate.getTime() - today.getTime();
+          daysRemaining = Math.max(0, Math.ceil(diffTime / (1000 * 60 * 60 * 24)));
+        }
+
+        const completedTasks = tasks.filter(t => t.status === 'DONE').length;
+        const activeProjects = myProjects.filter(p => p.status === 'IN_PROGRESS').length;
+        const avgProgress = myProjects.length > 0
+          ? myProjects.reduce((sum, p) => sum + p.progress, 0) / myProjects.length
+          : 0;
+
+        setMetrics({
+          totalInterns: myProjects.length,
+          activeProjects,
+          completedTasks,
+          successRate: avgProgress,
+          daysRemaining,
+        });
+      }
+    } catch (error: any) {
+      handleApiError(error, 'Erreur lors du chargement du dashboard');
     } finally {
       setLoading(false);
     }
@@ -151,15 +189,25 @@ export default function Dashboard() {
 
       {/* Cartes de métriques */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+        {authUser?.role === 'STAGIAIRE' ? (
+          <MetricCard
+            title="Jours Restants"
+            value={metrics.daysRemaining}
+            icon={Calendar}
+            color="bg-blue-500"
+            trend={{ value: 0, isPositive: false }}
+          />
+        ) : (
+          <MetricCard
+            title={authUser?.role === 'ADMIN' ? 'Total Stagiaires' : 'Mes Stagiaires'}
+            value={metrics.totalInterns}
+            icon={Users}
+            color="bg-blue-500"
+            trend={{ value: 0, isPositive: true }}
+          />
+        )}
         <MetricCard
-          title="Total Stagiaires"
-          value={metrics.totalInterns}
-          icon={Users}
-          color="bg-blue-500"
-          trend={{ value: 0, isPositive: true }}
-        />
-        <MetricCard
-          title="Projets Actifs"
+          title={authUser?.role === 'STAGIAIRE' ? 'Mon Projet' : 'Projets Actifs'}
           value={metrics.activeProjects}
           icon={FolderOpen}
           color="bg-green-500"
@@ -169,12 +217,12 @@ export default function Dashboard() {
           title="Tâches Terminées"
           value={metrics.completedTasks}
           icon={CheckSquare}
-          color="bg-purple-500"
+          color="bg-red-500"
           trend={{ value: 0, isPositive: true }}
         />
         <MetricCard
-          title="Taux de Réussite"
-          value={`${metrics.successRate}%`}
+          title={authUser?.role === 'STAGIAIRE' ? 'Progression Moyenne' : 'Taux de Réussite'}
+          value={`${Math.round(metrics.successRate)}%`}
           icon={TrendingUp}
           color="bg-orange-500"
           trend={{ value: 0, isPositive: true }}
